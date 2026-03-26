@@ -39,6 +39,32 @@ ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:install && pnpm ui:build
 
 
+# Fetch pinned gog release for the target platform.
+FROM debian:bookworm-slim AS gog-fetch
+ARG GOG_VERSION=v0.12.0
+ARG TARGETARCH
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+  ver="${GOG_VERSION#v}"; \
+  case "${TARGETARCH}" in \
+    amd64) gog_sha256="a03fccbd67ea2e59a26a56e92de8918577f4bebe4b2f946823419777827cdab2" ;; \
+    arm64) gog_sha256="d7f20494d7eb0e8716631853d055ccbb368c7b81cb8165f55b45884bccb67b4b" ;; \
+    *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+  esac; \
+  asset="gogcli_${ver}_linux_${TARGETARCH}.tar.gz"; \
+  url="https://github.com/steipete/gogcli/releases/download/${GOG_VERSION}/${asset}"; \
+  curl -fsSL -o "/tmp/${asset}" "${url}"; \
+  echo "${gog_sha256}  /tmp/${asset}" | sha256sum -c -; \
+  tar -xzf "/tmp/${asset}" -C /tmp; \
+  install -D -m 0755 /tmp/gog /out/gog
+
+
 # Runtime image
 FROM node:22-bookworm
 ENV NODE_ENV=production
@@ -54,6 +80,8 @@ RUN apt-get update \
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
+COPY --from=gog-fetch /out/gog /usr/local/bin/gog
+
 # Persist user-installed tools by default by targeting the Railway volume.
 # - npm global installs -> /data/npm
 # - pnpm global installs -> /data/pnpm (binaries) + /data/pnpm-store (store)
@@ -61,6 +89,8 @@ ENV NPM_CONFIG_PREFIX=/data/npm
 ENV NPM_CONFIG_CACHE=/data/npm-cache
 ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
+ENV XDG_CONFIG_HOME=/data/.config
+ENV GOG_KEYRING_BACKEND=file
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 
 WORKDIR /app
@@ -77,6 +107,7 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
   && chmod +x /usr/local/bin/openclaw
 
 COPY src ./src
+COPY skills ./skills
 
 # The wrapper listens on $PORT.
 # IMPORTANT: Do not set a default PORT here.

@@ -7,6 +7,8 @@ This repo packages **OpenClaw** for Railway with a small **/setup** web wizard s
 - **OpenClaw Gateway + Control UI** (served at `/` and `/openclaw`)
 - A friendly **Setup Wizard** at `/setup` (protected by a password)
 - Persistent state via **Railway Volume** (so config/credentials/memory survive redeploys)
+- **`gog` CLI** preinstalled in the image for Gmail/Calendar/Drive/Contacts/Sheets/Docs
+- A bundled **`gog` OpenClaw skill** seeded into the workspace on first boot
 - One-click **Export backup** (so users can migrate off Railway later)
 - **Import backup** from `/setup` (advanced recovery)
 
@@ -34,9 +36,15 @@ Recommended:
 
 Optional:
 - `OPENCLAW_GATEWAY_TOKEN` — if not set, the wrapper generates one (not ideal). In a template, set it using a generated secret.
+- `GOG_ACCOUNT` — default `gog` account/email alias for non-interactive commands
+- `GOG_CLIENT` — optional named OAuth client bucket for `gog`
+- `GOG_SERVICE_ACCOUNT_EMAIL` + `GOG_SERVICE_ACCOUNT_JSON_B64` — preferred `gog` bootstrap for Google Workspace/domain-wide delegation
+- `GOG_OAUTH_CLIENT_JSON_B64` + `GOG_OAUTH_TOKEN_JSON_B64` + `GOG_KEYRING_PASSWORD` — pre-seed `gog` OAuth auth from Railway secrets
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
+- All `GOG_*_JSON_B64` values should be base64-encoded file contents with newlines removed.
+- If both `gog` service-account and OAuth bootstrap secrets are present for the same account, `gog` prefers the service account.
 
 4) Enable **Public Networking** (HTTP). Railway will assign a domain.
    - This service listens on Railway’s injected `PORT` at runtime (recommended).
@@ -78,9 +86,11 @@ Railway containers have an ephemeral filesystem. Only the mounted volume at `/da
 
 What persists cleanly today:
 - **Custom skills / code:** anything under `OPENCLAW_WORKSPACE_DIR` (default: `/data/workspace`)
+- **Bundled `gog` skill copy:** seeded to `/data/workspace/skills/gog/SKILL.md` on first boot if missing
 - **Node global tools (npm/pnpm):** this template configures defaults so global installs land under `/data`:
   - npm globals: `/data/npm` (binaries in `/data/npm/bin`)
   - pnpm globals: `/data/pnpm` (binaries) + `/data/pnpm-store` (store)
+- **`gog` config + keyring:** `/data/.config/gogcli` (via `XDG_CONFIG_HOME=/data/.config` and `GOG_KEYRING_BACKEND=file`)
 - **Python packages:** create a venv under `/data` (example below). The runtime image includes Python + venv support.
 
 What does *not* persist cleanly:
@@ -91,6 +101,7 @@ What does *not* persist cleanly:
 
 If `/data/workspace/bootstrap.sh` exists, the wrapper will run it on startup (best-effort) before starting the gateway.
 Use this to initialize persistent install prefixes or create a venv.
+You do not need this hook for `gog`; the image already includes the binary, auth bootstrap, and skill seeding logic.
 
 Example `bootstrap.sh`:
 
@@ -104,6 +115,33 @@ python3 -m venv /data/venv || true
 # Example: ensure npm/pnpm dirs exist
 mkdir -p /data/npm /data/npm-cache /data/pnpm /data/pnpm-store
 ```
+
+## `gog` CLI and skill
+
+- The image includes `gog` at `/usr/local/bin/gog`.
+- On boot, the wrapper can hydrate `gog` auth from Railway secrets so `gog` is ready immediately after deploy.
+- The setup console includes safe `gog` commands for inspection and repair, including `gog.bootstrap`, `gog auth list`, `gog auth status`, `gog auth keyring`, and `gog auth service-account status <email>`.
+- The bundled `gog` skill is copied into `/data/workspace/skills/gog/SKILL.md` if it is not already present.
+
+### Recommended `gog` auth modes
+
+1. Google Workspace / service account (recommended)
+   - Set `GOG_SERVICE_ACCOUNT_EMAIL` to the user to impersonate.
+   - Set `GOG_SERVICE_ACCOUNT_JSON_B64` to the base64-encoded service-account JSON.
+2. Regular OAuth refresh token
+   - Set `GOG_OAUTH_CLIENT_JSON_B64` to the base64-encoded OAuth client JSON.
+   - Set `GOG_OAUTH_TOKEN_JSON_B64` to the base64-encoded token export JSON from an already-authorized `gog` install.
+   - Set `GOG_KEYRING_PASSWORD` so the file keyring works non-interactively in the container.
+
+Example base64 encoding on macOS/Linux:
+
+```bash
+base64 < service-account.json | tr -d '\n'
+base64 < oauth-client.json | tr -d '\n'
+base64 < gog-token-export.json | tr -d '\n'
+```
+
+After changing any `GOG_*` Railway secret, redeploy the service. If auth drifts, open `/setup` and run `gog.bootstrap`.
 
 ## Troubleshooting
 

@@ -78,6 +78,9 @@ const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
+const GOG_BIN = process.env.GOG_BIN?.trim() || "gog";
+const GOG_SKILL_SOURCE = path.join(process.cwd(), "skills", "gog", "SKILL.md");
+const GOG_SKILL_DEST = path.join(WORKSPACE_DIR, "skills", "gog", "SKILL.md");
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -142,9 +145,214 @@ let lastGatewayError = null;
 let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
+let lastGogBootstrap = null;
+let lastGogSkillSeed = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function truncateOutput(text, max = 20_000) {
+  const value = String(text || "");
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}\n... (truncated)\n`;
+}
+
+function gogEnv(overrides = {}) {
+  const env = { ...process.env };
+  if (!env.GOG_KEYRING_BACKEND) env.GOG_KEYRING_BACKEND = "file";
+  if (!env.XDG_CONFIG_HOME && fs.existsSync("/data")) env.XDG_CONFIG_HOME = "/data/.config";
+  return { ...env, ...overrides };
+}
+
+function runGog(args, opts = {}) {
+  return runCmd(GOG_BIN, ["--no-input", ...args], {
+    ...opts,
+    env: {
+      ...gogEnv(),
+      ...(opts.env || {}),
+    },
+  });
+}
+
+async function withTempDir(prefix, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  try {
+    return await fn(dir);
+  } finally {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function writeBase64File(filePath, base64Value) {
+  const normalized = String(base64Value || "").replace(/\s+/g, "").trim();
+  if (!normalized) throw new Error(`Missing base64 content for ${path.basename(filePath)}`);
+  const decoded = Buffer.from(normalized, "base64");
+  if (!decoded.length) throw new Error(`Decoded ${path.basename(filePath)} is empty`);
+  fs.writeFileSync(filePath, decoded, { mode: 0o600 });
+  return filePath;
+}
+
+function recordGogBootstrap(result) {
+  lastGogBootstrap = {
+    at: new Date().toISOString(),
+    ok: Boolean(result.ok),
+    configured: Boolean(result.configured),
+    output: truncateOutput(redactSecrets(result.output || "")),
+  };
+  return lastGogBootstrap;
+}
+
+function recordGogSkillSeed(result) {
+  lastGogSkillSeed = {
+    at: new Date().toISOString(),
+    ok: Boolean(result.ok),
+    seeded: Boolean(result.seeded),
+    source: result.source || null,
+    destination: result.destination || null,
+    output: truncateOutput(redactSecrets(result.output || "")),
+  };
+  return lastGogSkillSeed;
+}
+
+async function ensureGogReadyFromEnv() {
+  const serviceAccountJson = process.env.GOG_SERVICE_ACCOUNT_JSON_B64?.trim() || "";
+  const serviceAccountEmail = process.env.GOG_SERVICE_ACCOUNT_EMAIL?.trim() || process.env.GOG_ACCOUNT?.trim() || "";
+  const oauthClientJson = process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim() || "";
+  const oauthTokenJson = process.env.GOG_OAUTH_TOKEN_JSON_B64?.trim() || "";
+
+  const lines = [];
+  let ok = true;
+  let configured = false;
+
+  const version = await runGog(["--version"]);
+  if (version.code !== 0) {
+    return recordGogBootstrap({
+      ok: false,
+      configured: Boolean(serviceAccountJson || oauthClientJson || oauthTokenJson),
+      output: `[gog] failed to execute ${GOG_BIN} --version\n${version.output || ""}`,
+    });
+  }
+  lines.push(`[gog] version: ${version.output.trim()}`);
+
+  if (serviceAccountJson || process.env.GOG_SERVICE_ACCOUNT_EMAIL?.trim()) {
+    configured = true;
+    if (!serviceAccountJson || !serviceAccountEmail) {
+      ok = false;
+      lines.push("[gog] service account bootstrap requires GOG_SERVICE_ACCOUNT_JSON_B64 and GOG_SERVICE_ACCOUNT_EMAIL (or GOG_ACCOUNT).");
+    } else {
+      try {
+        await withTempDir("gog-sa-", async (dir) => {
+          const keyPath = writeBase64File(path.join(dir, "service-account.json"), serviceAccountJson);
+          const setResult = await runGog(["auth", "service-account", "set", serviceAccountEmail, "--key", keyPath]);
+          if (setResult.code !== 0) ok = false;
+          lines.push(`[gog] service-account set (${serviceAccountEmail}) exit=${setResult.code}`);
+          if (setResult.output) lines.push(setResult.output.trim());
+
+          const statusResult = await runGog(["auth", "service-account", "status", serviceAccountEmail]);
+          if (statusResult.code !== 0) ok = false;
+          lines.push(`[gog] service-account status (${serviceAccountEmail}) exit=${statusResult.code}`);
+          if (statusResult.output) lines.push(statusResult.output.trim());
+        });
+      } catch (err) {
+        ok = false;
+        lines.push(`[gog] service-account bootstrap failed: ${String(err)}`);
+      }
+    }
+  }
+
+  if (oauthClientJson || oauthTokenJson) {
+    configured = true;
+    if (!oauthClientJson || !oauthTokenJson) {
+      ok = false;
+      lines.push("[gog] OAuth bootstrap requires both GOG_OAUTH_CLIENT_JSON_B64 and GOG_OAUTH_TOKEN_JSON_B64.");
+    } else if (!process.env.GOG_KEYRING_PASSWORD?.trim()) {
+      ok = false;
+      lines.push("[gog] OAuth bootstrap requires GOG_KEYRING_PASSWORD when using the file keyring backend.");
+    } else {
+      try {
+        await withTempDir("gog-oauth-", async (dir) => {
+          const clientPath = writeBase64File(path.join(dir, "credentials.json"), oauthClientJson);
+          const tokenPath = writeBase64File(path.join(dir, "token.json"), oauthTokenJson);
+
+          const credentialsResult = await runGog(["auth", "credentials", clientPath]);
+          if (credentialsResult.code !== 0) ok = false;
+          lines.push(`[gog] auth credentials exit=${credentialsResult.code}`);
+          if (credentialsResult.output) lines.push(credentialsResult.output.trim());
+
+          const importResult = await runGog(["auth", "tokens", "import", tokenPath]);
+          if (importResult.code !== 0) ok = false;
+          lines.push(`[gog] auth tokens import exit=${importResult.code}`);
+          if (importResult.output) lines.push(importResult.output.trim());
+
+          const listResult = await runGog(["auth", "list"]);
+          if (listResult.code !== 0) ok = false;
+          lines.push(`[gog] auth list exit=${listResult.code}`);
+          if (listResult.output) lines.push(listResult.output.trim());
+        });
+      } catch (err) {
+        ok = false;
+        lines.push(`[gog] OAuth bootstrap failed: ${String(err)}`);
+      }
+    }
+  }
+
+  if (!configured) {
+    lines.push("[gog] no bootstrap secrets configured.");
+  }
+
+  return recordGogBootstrap({
+    ok,
+    configured,
+    output: `${lines.join("\n")}\n`,
+  });
+}
+
+function ensureGogSkillSeeded() {
+  try {
+    if (!fs.existsSync(GOG_SKILL_SOURCE)) {
+      return recordGogSkillSeed({
+        ok: false,
+        seeded: false,
+        source: GOG_SKILL_SOURCE,
+        destination: GOG_SKILL_DEST,
+        output: `[gog skill] bundled skill not found at ${GOG_SKILL_SOURCE}`,
+      });
+    }
+
+    if (fs.existsSync(GOG_SKILL_DEST)) {
+      return recordGogSkillSeed({
+        ok: true,
+        seeded: false,
+        source: GOG_SKILL_SOURCE,
+        destination: GOG_SKILL_DEST,
+        output: `[gog skill] skill already present at ${GOG_SKILL_DEST}`,
+      });
+    }
+
+    fs.mkdirSync(path.dirname(GOG_SKILL_DEST), { recursive: true });
+    fs.copyFileSync(GOG_SKILL_SOURCE, GOG_SKILL_DEST);
+
+    return recordGogSkillSeed({
+      ok: true,
+      seeded: true,
+      source: GOG_SKILL_SOURCE,
+      destination: GOG_SKILL_DEST,
+      output: `[gog skill] seeded ${GOG_SKILL_DEST}`,
+    });
+  } catch (err) {
+    return recordGogSkillSeed({
+      ok: false,
+      seeded: false,
+      source: GOG_SKILL_SOURCE,
+      destination: GOG_SKILL_DEST,
+      output: `[gog skill] failed: ${String(err)}`,
+    });
+  }
 }
 
 async function waitForGatewayReady(opts = {}) {
@@ -419,6 +627,14 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
         <option value="openclaw.devices.approve">openclaw devices approve &lt;requestId&gt;</option>
         <option value="openclaw.plugins.list">openclaw plugins list</option>
         <option value="openclaw.plugins.enable">openclaw plugins enable &lt;name&gt;</option>
+        <option value="gog.bootstrap">gog bootstrap from Railway secrets</option>
+        <option value="gog.version">gog --version</option>
+        <option value="gog.config.path">gog config path</option>
+        <option value="gog.auth.keyring">gog auth keyring</option>
+        <option value="gog.auth.list">gog auth list</option>
+        <option value="gog.auth.status">gog auth status</option>
+        <option value="gog.auth.credentials.list">gog auth credentials list</option>
+        <option value="gog.auth.service-account.status">gog auth service-account status &lt;email&gt;</option>
       </select>
       <input id="consoleArg" placeholder="Optional arg (e.g. 200, gateway.port)" style="flex: 1" />
       <button id="consoleRun" style="background:#0f172a">Run</button>
@@ -889,6 +1105,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const help = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
+  const gogVersion = await runGog(["--version"]);
+  const gogConfigPath = await runGog(["config", "path"]);
+  const gogKeyring = await runGog(["auth", "keyring"]);
 
   // Channel config checks (redact secrets before returning to client)
   const tg = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
@@ -896,6 +1115,9 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
 
   const tgOut = redactSecrets(tg.output || "");
   const dcOut = redactSecrets(dc.output || "");
+  const gogVersionOut = redactSecrets(gogVersion.output || "");
+  const gogConfigPathOut = redactSecrets(gogConfigPath.output || "");
+  const gogKeyringOut = redactSecrets(gogKeyring.output || "");
 
   res.json({
     wrapper: {
@@ -939,6 +1161,37 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
         },
       },
     },
+    gog: {
+      bin: GOG_BIN,
+      accountEnv: process.env.GOG_ACCOUNT || null,
+      clientEnv: process.env.GOG_CLIENT || null,
+      keyringBackendEnv: process.env.GOG_KEYRING_BACKEND || null,
+      keyringPasswordEnv: Boolean(process.env.GOG_KEYRING_PASSWORD?.trim()),
+      serviceAccountBootstrapConfigured:
+        Boolean(process.env.GOG_SERVICE_ACCOUNT_JSON_B64?.trim()) &&
+        Boolean((process.env.GOG_SERVICE_ACCOUNT_EMAIL || process.env.GOG_ACCOUNT || "").trim()),
+      oauthBootstrapConfigured:
+        Boolean(process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim()) &&
+        Boolean(process.env.GOG_OAUTH_TOKEN_JSON_B64?.trim()),
+      version: {
+        exit: gogVersion.code,
+        output: gogVersionOut.trim(),
+      },
+      configPath: {
+        exit: gogConfigPath.code,
+        output: gogConfigPathOut.trim(),
+      },
+      keyring: {
+        exit: gogKeyring.code,
+        output: gogKeyringOut.trim(),
+      },
+      lastBootstrap: lastGogBootstrap,
+      skill: {
+        source: GOG_SKILL_SOURCE,
+        destination: GOG_SKILL_DEST,
+        lastSeed: lastGogSkillSeed,
+      },
+    },
   });
 });
 
@@ -951,6 +1204,13 @@ function redactSecrets(text) {
     .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(gho_[A-Za-z0-9_]{10,})/g, "[REDACTED]")
     .replace(/(xox[baprs]-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
+    .replace(/(ya29\.[A-Za-z0-9._-]+)/g, "[REDACTED]")
+    .replace(/(1\/\/[A-Za-z0-9._-]+)/g, "[REDACTED]")
+    .replace(/(-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----)/g, "[REDACTED PRIVATE KEY]")
+    .replace(/(["']?client_secret["']?\s*[:=]\s*["'])([^"'\n]+)(["'])/gi, "$1[REDACTED]$3")
+    .replace(/(["']?refresh_token["']?\s*[:=]\s*["'])([^"'\n]+)(["'])/gi, "$1[REDACTED]$3")
+    .replace(/(["']?access_token["']?\s*[:=]\s*["'])([^"'\n]+)(["'])/gi, "$1[REDACTED]$3")
+    .replace(/(["']?private_key["']?\s*[:=]\s*["'])([^"']+)(["'])/gi, "$1[REDACTED]$3")
     // Telegram bot tokens look like: 123456:ABCDEF...
     .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
@@ -987,6 +1247,16 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   // Plugin management
   "openclaw.plugins.list",
   "openclaw.plugins.enable",
+
+  // gog CLI helpers
+  "gog.bootstrap",
+  "gog.version",
+  "gog.config.path",
+  "gog.auth.keyring",
+  "gog.auth.list",
+  "gog.auth.status",
+  "gog.auth.credentials.list",
+  "gog.auth.service-account.status",
 ]);
 
 app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
@@ -1070,6 +1340,42 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       if (!name) return res.status(400).json({ ok: false, error: "Missing plugin name" });
       if (!/^[A-Za-z0-9_-]+$/.test(name)) return res.status(400).json({ ok: false, error: "Invalid plugin name" });
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["plugins", "enable", name]));
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+
+    if (cmd === "gog.bootstrap") {
+      const result = await ensureGogReadyFromEnv();
+      return res.status(result.ok ? 200 : 500).json({ ok: result.ok, output: result.output });
+    }
+    if (cmd === "gog.version") {
+      const r = await runGog(["--version"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "gog.config.path") {
+      const r = await runGog(["config", "path"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "gog.auth.keyring") {
+      const r = await runGog(["auth", "keyring"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "gog.auth.list") {
+      const r = await runGog(["auth", "list"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "gog.auth.status") {
+      const r = await runGog(["auth", "status"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "gog.auth.credentials.list") {
+      const r = await runGog(["auth", "credentials", "list"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "gog.auth.service-account.status") {
+      const email = String(arg || "").trim();
+      if (!email) return res.status(400).json({ ok: false, error: "Missing account email" });
+      if (!/^[^\s@]+@[^\s@]+$/.test(email)) return res.status(400).json({ ok: false, error: "Invalid account email" });
+      const r = await runGog(["auth", "service-account", "status", email]);
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
 
@@ -1408,6 +1714,25 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
+  }
+
+  const gogSkill = ensureGogSkillSeeded();
+  if (gogSkill.ok) {
+    console.log(gogSkill.output.trim());
+  } else {
+    console.warn(gogSkill.output.trim());
+  }
+
+  try {
+    const gogBootstrap = await ensureGogReadyFromEnv();
+    const log = gogBootstrap.output.trim();
+    if (gogBootstrap.ok) {
+      console.log(log);
+    } else {
+      console.warn(log);
+    }
+  } catch (err) {
+    console.warn(`[wrapper] gog bootstrap failed (continuing): ${String(err)}`);
   }
 
   // Optional operator hook to install/persist extra tools under /data.
