@@ -65,6 +65,33 @@ RUN set -eux; \
   install -D -m 0755 /tmp/gog /out/gog
 
 
+# Fetch pinned jira-cli release for the target platform.
+FROM debian:bookworm-slim AS jira-fetch
+ARG JIRA_CLI_VERSION=v1.7.0
+ARG TARGETARCH
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+  ver="${JIRA_CLI_VERSION#v}"; \
+  case "${TARGETARCH}" in \
+    amd64) jira_arch="x86_64"; jira_sha256="b5e0ba4804f3f11f92c483d9a6ea9ebccec1c735cd2e12b0440cab9d7afd626a" ;; \
+    arm64) jira_arch="arm64"; jira_sha256="80aa3cc02790892b29e1580a8e49eb49a6550815b362c5ef8c05aea1dee73a95" ;; \
+    *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+  esac; \
+  asset="jira_${ver}_linux_${jira_arch}.tar.gz"; \
+  root="jira_${ver}_linux_${jira_arch}"; \
+  url="https://github.com/ankitpokhrel/jira-cli/releases/download/${JIRA_CLI_VERSION}/${asset}"; \
+  curl -fsSL -o "/tmp/${asset}" "${url}"; \
+  echo "${jira_sha256}  /tmp/${asset}" | sha256sum -c -; \
+  tar -xzf "/tmp/${asset}" -C /tmp; \
+  install -D -m 0755 "/tmp/${root}/bin/jira" /out/jira
+
+
 # Runtime image
 FROM node:22-bookworm
 ENV NODE_ENV=production
@@ -72,6 +99,8 @@ ENV NODE_ENV=production
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    gh \
     tini \
     python3 \
     python3-venv \
@@ -81,6 +110,7 @@ RUN apt-get update \
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
 COPY --from=gog-fetch /out/gog /usr/local/bin/gog
+COPY --from=jira-fetch /out/jira /usr/local/bin/jira
 
 # Persist user-installed tools by default by targeting the Railway volume.
 # - npm global installs -> /data/npm
@@ -91,6 +121,7 @@ ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
 ENV XDG_CONFIG_HOME=/data/.config
 ENV GOG_KEYRING_BACKEND=file
+ENV JIRA_CONFIG_FILE=/data/.config/.jira/.config.yml
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 
 WORKDIR /app
@@ -108,6 +139,7 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
 
 COPY src ./src
 COPY skills ./skills
+RUN npm --prefix "/app/skills/linear/scripts" ci --omit=dev
 
 # The wrapper listens on $PORT.
 # IMPORTANT: Do not set a default PORT here.

@@ -23,11 +23,14 @@ test("redactSecrets redacts gog oauth fields and tokens", () => {
   const s = [
     '{"client_secret":"secret-123","refresh_token":"1//refresh-token","access_token":"ya29.token-value"}',
     "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+    'JIRA_API_TOKEN="jira-secret-token"',
+    'Authorization: Bearer jira-secret-token',
   ].join("\n");
   const out = redact(s);
   assert.ok(!out.includes("secret-123"));
   assert.ok(!out.includes("1//refresh-token"));
   assert.ok(!out.includes("ya29.token-value"));
   assert.ok(!out.includes("BEGIN PRIVATE KEY"));
+  assert.ok(!out.includes("jira-secret-token"));
   assert.match(out, /\[REDACTED/);
 });

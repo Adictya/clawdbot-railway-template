@@ -79,8 +79,26 @@ const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}
 const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 const GOG_BIN = process.env.GOG_BIN?.trim() || "gog";
-const GOG_SKILL_SOURCE = path.join(process.cwd(), "skills", "gog", "SKILL.md");
-const GOG_SKILL_DEST = path.join(WORKSPACE_DIR, "skills", "gog", "SKILL.md");
+const JIRA_BIN = process.env.JIRA_BIN?.trim() || "jira";
+const CONFIG_HOME =
+  process.env.XDG_CONFIG_HOME?.trim() ||
+  (fs.existsSync("/data") ? "/data/.config" : path.join(os.homedir(), ".config"));
+const JIRA_CONFIG_FILE =
+  process.env.JIRA_CONFIG_FILE?.trim() ||
+  path.join(CONFIG_HOME, ".jira", ".config.yml");
+const EXTRA_BUNDLED_SKILLS = ["linear", "notion", "github"];
+const GOG_SKILL_SOURCE_DIR = path.join(process.cwd(), "skills", "gog");
+const GOG_SKILL_DEST_DIR = path.join(WORKSPACE_DIR, "skills", "gog");
+const JIRA_SKILL_SOURCE_DIR = path.join(process.cwd(), "skills", "jira");
+const JIRA_SKILL_DEST_DIR = path.join(WORKSPACE_DIR, "skills", "jira");
+
+function bundledSkillSourceDir(name) {
+  return path.join(process.cwd(), "skills", name);
+}
+
+function bundledSkillDestDir(name) {
+  return path.join(WORKSPACE_DIR, "skills", name);
+}
 
 function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
@@ -147,6 +165,8 @@ let lastDoctorOutput = null;
 let lastDoctorAt = null;
 let lastGogBootstrap = null;
 let lastGogSkillSeed = null;
+let lastJiraBootstrap = null;
+let lastJiraSkillSeed = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -170,6 +190,24 @@ function runGog(args, opts = {}) {
     ...opts,
     env: {
       ...gogEnv(),
+      ...(opts.env || {}),
+    },
+  });
+}
+
+function jiraEnv(overrides = {}) {
+  const env = { ...process.env };
+  if (!env.XDG_CONFIG_HOME) env.XDG_CONFIG_HOME = CONFIG_HOME;
+  if (!env.JIRA_CONFIG_FILE) env.JIRA_CONFIG_FILE = JIRA_CONFIG_FILE;
+  if (!env.PAGER) env.PAGER = "cat";
+  return { ...env, ...overrides };
+}
+
+function runJira(args, opts = {}) {
+  return runCmd(JIRA_BIN, args, {
+    ...opts,
+    env: {
+      ...jiraEnv(),
       ...(opts.env || {}),
     },
   });
@@ -217,6 +255,73 @@ function recordGogSkillSeed(result) {
     output: truncateOutput(redactSecrets(result.output || "")),
   };
   return lastGogSkillSeed;
+}
+
+function recordJiraBootstrap(result) {
+  lastJiraBootstrap = {
+    at: new Date().toISOString(),
+    ok: Boolean(result.ok),
+    configured: Boolean(result.configured),
+    output: truncateOutput(redactSecrets(result.output || "")),
+  };
+  return lastJiraBootstrap;
+}
+
+function recordJiraSkillSeed(result) {
+  lastJiraSkillSeed = {
+    at: new Date().toISOString(),
+    ok: Boolean(result.ok),
+    seeded: Boolean(result.seeded),
+    source: result.source || null,
+    destination: result.destination || null,
+    output: truncateOutput(redactSecrets(result.output || "")),
+  };
+  return lastJiraSkillSeed;
+}
+
+function seedBundledSkill(sourceDir, destinationDir, record = (result) => result) {
+  try {
+    const skillName = path.basename(sourceDir);
+    const skillFile = path.join(sourceDir, "SKILL.md");
+    if (!fs.existsSync(skillFile)) {
+      return record({
+        ok: false,
+        seeded: false,
+        source: sourceDir,
+        destination: destinationDir,
+        output: `[skill:${skillName}] bundled skill not found at ${sourceDir}`,
+      });
+    }
+
+    if (fs.existsSync(destinationDir)) {
+      return record({
+        ok: true,
+        seeded: false,
+        source: sourceDir,
+        destination: destinationDir,
+        output: `[skill:${skillName}] skill already present at ${destinationDir}`,
+      });
+    }
+
+    fs.mkdirSync(path.dirname(destinationDir), { recursive: true });
+    fs.cpSync(sourceDir, destinationDir, { recursive: true });
+
+    return record({
+      ok: true,
+      seeded: true,
+      source: sourceDir,
+      destination: destinationDir,
+      output: `[skill:${skillName}] seeded ${destinationDir}`,
+    });
+  } catch (err) {
+    return record({
+      ok: false,
+      seeded: false,
+      source: sourceDir,
+      destination: destinationDir,
+      output: `[skill:${path.basename(sourceDir)}] failed: ${String(err)}`,
+    });
+  }
 }
 
 async function ensureGogReadyFromEnv() {
@@ -313,46 +418,92 @@ async function ensureGogReadyFromEnv() {
 }
 
 function ensureGogSkillSeeded() {
-  try {
-    if (!fs.existsSync(GOG_SKILL_SOURCE)) {
-      return recordGogSkillSeed({
-        ok: false,
-        seeded: false,
-        source: GOG_SKILL_SOURCE,
-        destination: GOG_SKILL_DEST,
-        output: `[gog skill] bundled skill not found at ${GOG_SKILL_SOURCE}`,
-      });
-    }
+  return seedBundledSkill(GOG_SKILL_SOURCE_DIR, GOG_SKILL_DEST_DIR, recordGogSkillSeed);
+}
 
-    if (fs.existsSync(GOG_SKILL_DEST)) {
-      return recordGogSkillSeed({
-        ok: true,
-        seeded: false,
-        source: GOG_SKILL_SOURCE,
-        destination: GOG_SKILL_DEST,
-        output: `[gog skill] skill already present at ${GOG_SKILL_DEST}`,
-      });
-    }
+async function ensureJiraReadyFromEnv() {
+  const server = process.env.JIRA_SERVER?.trim() || "";
+  const login = process.env.JIRA_LOGIN?.trim() || "";
+  const project = process.env.JIRA_PROJECT?.trim() || "";
+  const board = process.env.JIRA_BOARD?.trim() || "";
+  const apiToken = process.env.JIRA_API_TOKEN?.trim() || "";
+  const installation = (process.env.JIRA_INSTALLATION?.trim() || "cloud").toLowerCase();
+  const authType = (process.env.JIRA_AUTH_TYPE?.trim() || "").toLowerCase();
+  const insecure = /^(1|true|yes|on)$/i.test(process.env.JIRA_INSECURE?.trim() || "");
 
-    fs.mkdirSync(path.dirname(GOG_SKILL_DEST), { recursive: true });
-    fs.copyFileSync(GOG_SKILL_SOURCE, GOG_SKILL_DEST);
+  const lines = [];
+  let ok = true;
+  let configured = false;
 
-    return recordGogSkillSeed({
-      ok: true,
-      seeded: true,
-      source: GOG_SKILL_SOURCE,
-      destination: GOG_SKILL_DEST,
-      output: `[gog skill] seeded ${GOG_SKILL_DEST}`,
-    });
-  } catch (err) {
-    return recordGogSkillSeed({
+  const version = await runJira(["version"]);
+  if (version.code !== 0) {
+    return recordJiraBootstrap({
       ok: false,
-      seeded: false,
-      source: GOG_SKILL_SOURCE,
-      destination: GOG_SKILL_DEST,
-      output: `[gog skill] failed: ${String(err)}`,
+      configured: Boolean(server || login || project || apiToken),
+      output: `[jira] failed to execute ${JIRA_BIN} version\n${version.output || ""}`,
     });
   }
+  lines.push(`[jira] version: ${version.output.trim()}`);
+
+  if (server || login || project || apiToken) {
+    configured = true;
+    if (!server || !login || !project || !apiToken) {
+      ok = false;
+      lines.push("[jira] bootstrap requires JIRA_SERVER, JIRA_LOGIN, JIRA_PROJECT, and JIRA_API_TOKEN.");
+    } else if (!["cloud", "local"].includes(installation)) {
+      ok = false;
+      lines.push("[jira] JIRA_INSTALLATION must be either 'cloud' or 'local'.");
+    } else if (authType && !["basic", "bearer", "mtls"].includes(authType)) {
+      ok = false;
+      lines.push("[jira] JIRA_AUTH_TYPE must be basic, bearer, or mtls when set.");
+    } else {
+      try {
+        fs.mkdirSync(path.dirname(JIRA_CONFIG_FILE), { recursive: true });
+        const args = [
+          "init",
+          "--force",
+          "--installation",
+          installation,
+          "--server",
+          server,
+          "--login",
+          login,
+          "--project",
+          project,
+          "-c",
+          JIRA_CONFIG_FILE,
+        ];
+        if (board) args.push("--board", board);
+        if (authType) args.push("--auth-type", authType);
+        if (insecure) args.push("--insecure");
+
+        const initResult = await runJira(args);
+        if (initResult.code !== 0) ok = false;
+        lines.push(`[jira] init exit=${initResult.code}`);
+        if (initResult.output) lines.push(initResult.output.trim());
+
+        const meResult = await runJira(["me", "-c", JIRA_CONFIG_FILE]);
+        if (meResult.code !== 0) ok = false;
+        lines.push(`[jira] me exit=${meResult.code}`);
+        if (meResult.output) lines.push(meResult.output.trim());
+      } catch (err) {
+        ok = false;
+        lines.push(`[jira] bootstrap failed: ${String(err)}`);
+      }
+    }
+  } else {
+    lines.push("[jira] no bootstrap secrets configured.");
+  }
+
+  return recordJiraBootstrap({
+    ok,
+    configured,
+    output: `${lines.join("\n")}\n`,
+  });
+}
+
+function ensureJiraSkillSeeded() {
+  return seedBundledSkill(JIRA_SKILL_SOURCE_DIR, JIRA_SKILL_DEST_DIR, recordJiraSkillSeed);
 }
 
 async function waitForGatewayReady(opts = {}) {
@@ -635,6 +786,13 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
         <option value="gog.auth.status">gog auth status</option>
         <option value="gog.auth.credentials.list">gog auth credentials list</option>
         <option value="gog.auth.service-account.status">gog auth service-account status &lt;email&gt;</option>
+        <option value="jira.bootstrap">jira bootstrap from Railway secrets</option>
+        <option value="jira.version">jira version</option>
+        <option value="jira.me">jira me</option>
+        <option value="jira.serverinfo">jira serverinfo</option>
+        <option value="jira.issue.list">jira issue list --plain --paginate 5</option>
+        <option value="jira.project.list">jira project list</option>
+        <option value="jira.issue.view">jira issue view &lt;ISSUE-123&gt;</option>
       </select>
       <input id="consoleArg" placeholder="Optional arg (e.g. 200, gateway.port)" style="flex: 1" />
       <button id="consoleRun" style="background:#0f172a">Run</button>
@@ -1108,6 +1266,9 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const gogVersion = await runGog(["--version"]);
   const gogConfigPath = await runGog(["config", "path"]);
   const gogKeyring = await runGog(["auth", "keyring"]);
+  const jiraVersion = await runJira(["version"]);
+  const jiraMe = await runJira(["me", "-c", JIRA_CONFIG_FILE]);
+  const jiraServerInfo = await runJira(["serverinfo", "-c", JIRA_CONFIG_FILE]);
 
   // Channel config checks (redact secrets before returning to client)
   const tg = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "channels.telegram"]));
@@ -1118,6 +1279,9 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const gogVersionOut = redactSecrets(gogVersion.output || "");
   const gogConfigPathOut = redactSecrets(gogConfigPath.output || "");
   const gogKeyringOut = redactSecrets(gogKeyring.output || "");
+  const jiraVersionOut = redactSecrets(jiraVersion.output || "");
+  const jiraMeOut = redactSecrets(jiraMe.output || "");
+  const jiraServerInfoOut = redactSecrets(jiraServerInfo.output || "");
 
   res.json({
     wrapper: {
@@ -1187,9 +1351,40 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       },
       lastBootstrap: lastGogBootstrap,
       skill: {
-        source: GOG_SKILL_SOURCE,
-        destination: GOG_SKILL_DEST,
+        source: GOG_SKILL_SOURCE_DIR,
+        destination: GOG_SKILL_DEST_DIR,
         lastSeed: lastGogSkillSeed,
+      },
+    },
+    jira: {
+      bin: JIRA_BIN,
+      configFile: JIRA_CONFIG_FILE,
+      configExists: fs.existsSync(JIRA_CONFIG_FILE),
+      serverEnv: process.env.JIRA_SERVER || null,
+      loginEnv: process.env.JIRA_LOGIN || null,
+      projectEnv: process.env.JIRA_PROJECT || null,
+      boardEnv: process.env.JIRA_BOARD || null,
+      installationEnv: process.env.JIRA_INSTALLATION || null,
+      authTypeEnv: process.env.JIRA_AUTH_TYPE || null,
+      insecureEnv: process.env.JIRA_INSECURE || null,
+      apiTokenEnv: Boolean(process.env.JIRA_API_TOKEN?.trim()),
+      version: {
+        exit: jiraVersion.code,
+        output: jiraVersionOut.trim(),
+      },
+      me: {
+        exit: jiraMe.code,
+        output: jiraMeOut.trim(),
+      },
+      serverInfo: {
+        exit: jiraServerInfo.code,
+        output: jiraServerInfoOut.trim(),
+      },
+      lastBootstrap: lastJiraBootstrap,
+      skill: {
+        source: JIRA_SKILL_SOURCE_DIR,
+        destination: JIRA_SKILL_DEST_DIR,
+        lastSeed: lastJiraSkillSeed,
       },
     },
   });
@@ -1211,6 +1406,9 @@ function redactSecrets(text) {
     .replace(/(["']?refresh_token["']?\s*[:=]\s*["'])([^"'\n]+)(["'])/gi, "$1[REDACTED]$3")
     .replace(/(["']?access_token["']?\s*[:=]\s*["'])([^"'\n]+)(["'])/gi, "$1[REDACTED]$3")
     .replace(/(["']?private_key["']?\s*[:=]\s*["'])([^"']+)(["'])/gi, "$1[REDACTED]$3")
+    .replace(/(["']?JIRA_API_TOKEN["']?\s*[:=]\s*["']?)([^"'\s\n]+)(["']?)/gi, "$1[REDACTED]$3")
+    .replace(/(Authorization\s*:\s*Basic\s+)(\S+)/gi, "$1[REDACTED]")
+    .replace(/(Authorization\s*:\s*Bearer\s+)(\S+)/gi, "$1[REDACTED]")
     // Telegram bot tokens look like: 123456:ABCDEF...
     .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
@@ -1257,6 +1455,15 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   "gog.auth.status",
   "gog.auth.credentials.list",
   "gog.auth.service-account.status",
+
+  // jira CLI helpers
+  "jira.bootstrap",
+  "jira.version",
+  "jira.me",
+  "jira.serverinfo",
+  "jira.issue.list",
+  "jira.project.list",
+  "jira.issue.view",
 ]);
 
 app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
@@ -1376,6 +1583,38 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       if (!email) return res.status(400).json({ ok: false, error: "Missing account email" });
       if (!/^[^\s@]+@[^\s@]+$/.test(email)) return res.status(400).json({ ok: false, error: "Invalid account email" });
       const r = await runGog(["auth", "service-account", "status", email]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+
+    if (cmd === "jira.bootstrap") {
+      const result = await ensureJiraReadyFromEnv();
+      return res.status(result.ok ? 200 : 500).json({ ok: result.ok, output: result.output });
+    }
+    if (cmd === "jira.version") {
+      const r = await runJira(["version"]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "jira.me") {
+      const r = await runJira(["me", "-c", JIRA_CONFIG_FILE]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "jira.serverinfo") {
+      const r = await runJira(["serverinfo", "-c", JIRA_CONFIG_FILE]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "jira.issue.list") {
+      const r = await runJira(["issue", "list", "--plain", "--paginate", "5", "-c", JIRA_CONFIG_FILE]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "jira.project.list") {
+      const r = await runJira(["project", "list", "-c", JIRA_CONFIG_FILE]);
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "jira.issue.view") {
+      const issueKey = String(arg || "").trim().toUpperCase();
+      if (!issueKey) return res.status(400).json({ ok: false, error: "Missing issue key" });
+      if (!/^[A-Z][A-Z0-9]+-\d+$/.test(issueKey)) return res.status(400).json({ ok: false, error: "Invalid issue key" });
+      const r = await runJira(["issue", "view", issueKey, "--raw", "-c", JIRA_CONFIG_FILE]);
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
 
@@ -1723,6 +1962,25 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     console.warn(gogSkill.output.trim());
   }
 
+  const jiraSkill = ensureJiraSkillSeeded();
+  if (jiraSkill.ok) {
+    console.log(jiraSkill.output.trim());
+  } else {
+    console.warn(jiraSkill.output.trim());
+  }
+
+  for (const skillName of EXTRA_BUNDLED_SKILLS) {
+    const seeded = seedBundledSkill(
+      bundledSkillSourceDir(skillName),
+      bundledSkillDestDir(skillName),
+    );
+    if (seeded.ok) {
+      console.log(seeded.output.trim());
+    } else {
+      console.warn(seeded.output.trim());
+    }
+  }
+
   try {
     const gogBootstrap = await ensureGogReadyFromEnv();
     const log = gogBootstrap.output.trim();
@@ -1733,6 +1991,18 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     }
   } catch (err) {
     console.warn(`[wrapper] gog bootstrap failed (continuing): ${String(err)}`);
+  }
+
+  try {
+    const jiraBootstrap = await ensureJiraReadyFromEnv();
+    const log = jiraBootstrap.output.trim();
+    if (jiraBootstrap.ok) {
+      console.log(log);
+    } else {
+      console.warn(log);
+    }
+  } catch (err) {
+    console.warn(`[wrapper] jira bootstrap failed (continuing): ${String(err)}`);
   }
 
   // Optional operator hook to install/persist extra tools under /data.

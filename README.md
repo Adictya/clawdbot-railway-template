@@ -8,7 +8,11 @@ This repo packages **OpenClaw** for Railway with a small **/setup** web wizard s
 - A friendly **Setup Wizard** at `/setup` (protected by a password)
 - Persistent state via **Railway Volume** (so config/credentials/memory survive redeploys)
 - **`gog` CLI** preinstalled in the image for Gmail/Calendar/Drive/Contacts/Sheets/Docs
+- **`jira` CLI** preinstalled in the image for Jira issue and sprint workflows
+- **`gh` CLI** and `curl` available for GitHub and Notion workflows
 - A bundled **`gog` OpenClaw skill** seeded into the workspace on first boot
+- A bundled **`jira` OpenClaw skill** seeded into the workspace on first boot
+- Bundled **`linear`**, **`notion`**, and **`github`** OpenClaw skills seeded into the workspace on first boot
 - One-click **Export backup** (so users can migrate off Railway later)
 - **Import backup** from `/setup` (advanced recovery)
 
@@ -40,11 +44,21 @@ Optional:
 - `GOG_CLIENT` — optional named OAuth client bucket for `gog`
 - `GOG_SERVICE_ACCOUNT_EMAIL` + `GOG_SERVICE_ACCOUNT_JSON_B64` — preferred `gog` bootstrap for Google Workspace/domain-wide delegation
 - `GOG_OAUTH_CLIENT_JSON_B64` + `GOG_OAUTH_TOKEN_JSON_B64` + `GOG_KEYRING_PASSWORD` — pre-seed `gog` OAuth auth from Railway secrets
+- `JIRA_SERVER` + `JIRA_LOGIN` + `JIRA_PROJECT` + `JIRA_API_TOKEN` — bootstrap `jira` CLI on first boot
+- `JIRA_INSTALLATION=cloud|local` — defaults to `cloud`
+- `JIRA_AUTH_TYPE=basic|bearer|mtls` — set `bearer` for Jira Server/Data Center PATs
+- `JIRA_BOARD` — optional default board name for `jira init`
+- `JIRA_INSECURE=true` — optional; only for trusted self-signed Jira instances
+- `LINEAR_API_KEY` — enables the bundled Linear skill
+- `NOTION_API_KEY` — preferred auth for the bundled Notion skill
+- `GH_TOKEN` or `GITHUB_TOKEN` — recommended non-interactive auth for the bundled GitHub skill / `gh`
 
 Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
 - All `GOG_*_JSON_B64` values should be base64-encoded file contents with newlines removed.
 - If both `gog` service-account and OAuth bootstrap secrets are present for the same account, `gog` prefers the service account.
+- `jira` stores config metadata on disk, but continues to read `JIRA_API_TOKEN` from Railway env at runtime.
+- The Linear skill ships with its Node dependencies preinstalled in the image.
 
 4) Enable **Public Networking** (HTTP). Railway will assign a domain.
    - This service listens on Railway’s injected `PORT` at runtime (recommended).
@@ -87,10 +101,14 @@ Railway containers have an ephemeral filesystem. Only the mounted volume at `/da
 What persists cleanly today:
 - **Custom skills / code:** anything under `OPENCLAW_WORKSPACE_DIR` (default: `/data/workspace`)
 - **Bundled `gog` skill copy:** seeded to `/data/workspace/skills/gog/SKILL.md` on first boot if missing
+- **Bundled `jira` skill copy:** seeded to `/data/workspace/skills/jira/SKILL.md` on first boot if missing
+- **Bundled extra skill copies:** seeded under `/data/workspace/skills/{linear,notion,github}` on first boot if missing
 - **Node global tools (npm/pnpm):** this template configures defaults so global installs land under `/data`:
   - npm globals: `/data/npm` (binaries in `/data/npm/bin`)
   - pnpm globals: `/data/pnpm` (binaries) + `/data/pnpm-store` (store)
 - **`gog` config + keyring:** `/data/.config/gogcli` (via `XDG_CONFIG_HOME=/data/.config` and `GOG_KEYRING_BACKEND=file`)
+- **`jira` config:** `/data/.config/.jira/.config.yml` (via `JIRA_CONFIG_FILE=/data/.config/.jira/.config.yml`)
+- **Notion file fallback:** `/data/.config/notion/api_key` if you choose file-based auth instead of `NOTION_API_KEY`
 - **Python packages:** create a venv under `/data` (example below). The runtime image includes Python + venv support.
 
 What does *not* persist cleanly:
@@ -142,6 +160,33 @@ base64 < gog-token-export.json | tr -d '\n'
 ```
 
 After changing any `GOG_*` Railway secret, redeploy the service. If auth drifts, open `/setup` and run `gog.bootstrap`.
+
+## `jira` CLI and skill
+
+- The image includes `jira` at `/usr/local/bin/jira`.
+- On boot, the wrapper can generate Jira CLI config from Railway secrets by running `jira init --force ...` internally.
+- The setup console includes safe Jira commands for inspection and repair, including `jira.bootstrap`, `jira version`, `jira me`, `jira serverinfo`, and `jira issue view <ISSUE-123>`.
+- The bundled Jira skill is copied into `/data/workspace/skills/jira/` if it is not already present.
+
+### Recommended `jira` bootstrap vars
+
+- `JIRA_SERVER=https://yourcompany.atlassian.net`
+- `JIRA_LOGIN=you@example.com`
+- `JIRA_PROJECT=PROJ`
+- `JIRA_API_TOKEN=...`
+- Optional: `JIRA_INSTALLATION=cloud` or `local`
+- Optional: `JIRA_AUTH_TYPE=bearer` for Jira Server/Data Center PATs
+- Optional: `JIRA_BOARD=Platform Team`
+- Optional: `JIRA_INSECURE=true` for trusted self-signed Jira instances only
+
+After changing any `JIRA_*` Railway secret, redeploy the service. If auth drifts or the config needs to be regenerated, open `/setup` and run `jira.bootstrap`.
+
+## `linear`, `notion`, and `github` skills
+
+- The bundled `linear` skill runs a local Node script at `/data/workspace/skills/linear/scripts/linear-cli.js` and uses `LINEAR_API_KEY`.
+- The bundled `github` skill uses the preinstalled `gh` CLI. For non-interactive use, set `GH_TOKEN` or `GITHUB_TOKEN`.
+- The bundled `notion` skill uses `curl`. Prefer `NOTION_API_KEY`; if you want file-based fallback, place the key at `/data/.config/notion/api_key`.
+- These skills are seeded automatically on first boot, like `gog` and `jira`.
 
 ## Troubleshooting
 
