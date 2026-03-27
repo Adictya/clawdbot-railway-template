@@ -83,6 +83,10 @@ const JIRA_BIN = process.env.JIRA_BIN?.trim() || "jira";
 const CONFIG_HOME =
   process.env.XDG_CONFIG_HOME?.trim() ||
   (fs.existsSync("/data") ? "/data/.config" : path.join(os.homedir(), ".config"));
+const GOG_KEYRING_PASSWORD_FILE =
+  process.env.GOG_WRAPPER_KEYRING_PASSWORD_FILE?.trim() ||
+  path.join(CONFIG_HOME, "gogcli", ".wrapper-keyring-password");
+const GOG_DEFAULT_SERVICES = process.env.GOG_DEFAULT_SERVICES?.trim() || "user";
 const JIRA_CONFIG_FILE =
   process.env.JIRA_CONFIG_FILE?.trim() ||
   path.join(CONFIG_HOME, ".jira", ".config.yml");
@@ -178,20 +182,67 @@ function truncateOutput(text, max = 20_000) {
   return `${value.slice(0, max)}\n... (truncated)\n`;
 }
 
+function readGogStoredKeyringPassword() {
+  try {
+    const value = fs.readFileSync(GOG_KEYRING_PASSWORD_FILE, "utf8").trim();
+    return value || "";
+  } catch {
+    return "";
+  }
+}
+
+function ensureGogStoredKeyringPassword() {
+  const existing = readGogStoredKeyringPassword();
+  if (existing) return { password: existing, created: false };
+
+  const generated = crypto.randomBytes(32).toString("hex");
+  fs.mkdirSync(path.dirname(GOG_KEYRING_PASSWORD_FILE), { recursive: true });
+  fs.writeFileSync(GOG_KEYRING_PASSWORD_FILE, `${generated}\n`, { mode: 0o600 });
+  return { password: generated, created: true };
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+$/.test(String(value || "").trim());
+}
+
+function resolveGogAccount(value) {
+  const account = String(
+    value || process.env.GOG_ACCOUNT || process.env.GOG_SERVICE_ACCOUNT_EMAIL || "",
+  ).trim();
+  if (!account) throw new Error("Missing Google account email. Set GOG_ACCOUNT or enter it in /setup.");
+  if (!isValidEmail(account)) throw new Error(`Invalid Google account email: ${account}`);
+  return account;
+}
+
+function extractFirstUrl(text) {
+  const match = String(text || "").match(/https?:\/\/[^\s"'<>]+/);
+  return match ? match[0] : "";
+}
+
 function gogEnv(overrides = {}) {
   const env = { ...process.env };
   if (!env.GOG_KEYRING_BACKEND) env.GOG_KEYRING_BACKEND = "file";
   if (!env.XDG_CONFIG_HOME && fs.existsSync("/data")) env.XDG_CONFIG_HOME = "/data/.config";
+  if (!env.GOG_WRAPPER_KEYRING_PASSWORD_FILE) env.GOG_WRAPPER_KEYRING_PASSWORD_FILE = GOG_KEYRING_PASSWORD_FILE;
+  if (!env.GOG_KEYRING_PASSWORD) {
+    const storedPassword = readGogStoredKeyringPassword();
+    if (storedPassword) env.GOG_KEYRING_PASSWORD = storedPassword;
+  }
   return { ...env, ...overrides };
 }
 
 function runGog(args, opts = {}) {
+  const { ensureKeyringPassword, ...cmdOpts } = opts;
+  const env = {
+    ...gogEnv(),
+    ...(cmdOpts.env || {}),
+  };
+  if (ensureKeyringPassword && !env.GOG_KEYRING_PASSWORD && env.GOG_KEYRING_BACKEND === "file") {
+    env.GOG_KEYRING_PASSWORD = ensureGogStoredKeyringPassword().password;
+  }
   return runCmd(GOG_BIN, ["--no-input", ...args], {
-    ...opts,
-    env: {
-      ...gogEnv(),
-      ...(opts.env || {}),
-    },
+    ...cmdOpts,
+    env,
   });
 }
 
@@ -255,6 +306,45 @@ function recordGogSkillSeed(result) {
     output: truncateOutput(redactSecrets(result.output || "")),
   };
   return lastGogSkillSeed;
+}
+
+async function ensureGogOAuthClientCredentialsFromEnv() {
+  const oauthClientJson = process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim() || "";
+  if (!oauthClientJson) {
+    return {
+      ok: false,
+      configured: false,
+      output: "[gog] no OAuth client JSON configured.",
+    };
+  }
+
+  const lines = [];
+  let ok = true;
+
+  try {
+    await withTempDir("gog-oauth-client-", async (dir) => {
+      const clientPath = writeBase64File(path.join(dir, "credentials.json"), oauthClientJson);
+
+      const credentialsResult = await runGog(["auth", "credentials", "set", clientPath]);
+      if (credentialsResult.code !== 0) ok = false;
+      lines.push(`[gog] auth credentials set exit=${credentialsResult.code}`);
+      if (credentialsResult.output) lines.push(credentialsResult.output.trim());
+
+      const listResult = await runGog(["auth", "credentials", "list"]);
+      if (listResult.code !== 0) ok = false;
+      lines.push(`[gog] auth credentials list exit=${listResult.code}`);
+      if (listResult.output) lines.push(listResult.output.trim());
+    });
+  } catch (err) {
+    ok = false;
+    lines.push(`[gog] auth credentials setup failed: ${String(err)}`);
+  }
+
+  return {
+    ok,
+    configured: true,
+    output: `${lines.join("\n")}\n`,
+  };
 }
 
 function recordJiraBootstrap(result) {
@@ -353,7 +443,7 @@ async function ensureGogReadyFromEnv() {
       try {
         await withTempDir("gog-sa-", async (dir) => {
           const keyPath = writeBase64File(path.join(dir, "service-account.json"), serviceAccountJson);
-          const setResult = await runGog(["auth", "service-account", "set", serviceAccountEmail, "--key", keyPath]);
+          const setResult = await runGog(["auth", "service-account", "set", `--key=${keyPath}`, serviceAccountEmail]);
           if (setResult.code !== 0) ok = false;
           lines.push(`[gog] service-account set (${serviceAccountEmail}) exit=${setResult.code}`);
           if (setResult.output) lines.push(setResult.output.trim());
@@ -372,24 +462,18 @@ async function ensureGogReadyFromEnv() {
 
   if (oauthClientJson || oauthTokenJson) {
     configured = true;
-    if (!oauthClientJson || !oauthTokenJson) {
-      ok = false;
-      lines.push("[gog] OAuth bootstrap requires both GOG_OAUTH_CLIENT_JSON_B64 and GOG_OAUTH_TOKEN_JSON_B64.");
-    } else if (!process.env.GOG_KEYRING_PASSWORD?.trim()) {
-      ok = false;
-      lines.push("[gog] OAuth bootstrap requires GOG_KEYRING_PASSWORD when using the file keyring backend.");
-    } else {
+    if (oauthClientJson) {
+      const credentialsSetup = await ensureGogOAuthClientCredentialsFromEnv();
+      if (!credentialsSetup.ok) ok = false;
+      lines.push(credentialsSetup.output.trim());
+    }
+
+    if (oauthTokenJson) {
       try {
-        await withTempDir("gog-oauth-", async (dir) => {
-          const clientPath = writeBase64File(path.join(dir, "credentials.json"), oauthClientJson);
+        await withTempDir("gog-oauth-token-", async (dir) => {
           const tokenPath = writeBase64File(path.join(dir, "token.json"), oauthTokenJson);
 
-          const credentialsResult = await runGog(["auth", "credentials", clientPath]);
-          if (credentialsResult.code !== 0) ok = false;
-          lines.push(`[gog] auth credentials exit=${credentialsResult.code}`);
-          if (credentialsResult.output) lines.push(credentialsResult.output.trim());
-
-          const importResult = await runGog(["auth", "tokens", "import", tokenPath]);
+          const importResult = await runGog(["auth", "tokens", "import", tokenPath], { ensureKeyringPassword: true });
           if (importResult.code !== 0) ok = false;
           lines.push(`[gog] auth tokens import exit=${importResult.code}`);
           if (importResult.output) lines.push(importResult.output.trim());
@@ -403,6 +487,9 @@ async function ensureGogReadyFromEnv() {
         ok = false;
         lines.push(`[gog] OAuth bootstrap failed: ${String(err)}`);
       }
+    } else if (oauthClientJson) {
+      lines.push("[gog] OAuth client credentials installed; interactive account authorization is still required.");
+      lines.push("[gog] Open /setup and use the gog OAuth card to generate the Google auth URL, approve access, and paste back the final redirect URL.");
     }
   }
 
@@ -415,6 +502,83 @@ async function ensureGogReadyFromEnv() {
     configured,
     output: `${lines.join("\n")}\n`,
   });
+}
+
+async function startGogRemoteAuthFlow(accountInput) {
+  const account = resolveGogAccount(accountInput);
+  const lines = [];
+
+  if (process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim()) {
+    const credentialsSetup = await ensureGogOAuthClientCredentialsFromEnv();
+    lines.push(credentialsSetup.output.trim());
+    if (!credentialsSetup.ok) {
+      return {
+        ok: false,
+        account,
+        authUrl: "",
+        output: `${lines.join("\n")}\n`,
+      };
+    }
+  }
+
+  const step1 = await runGog([
+    "auth",
+    "add",
+    account,
+    "--services",
+    GOG_DEFAULT_SERVICES,
+    "--remote",
+    "--step",
+    "1",
+  ]);
+  lines.push(`[gog] auth add remote step 1 (${account}) exit=${step1.code}`);
+  if (step1.output) lines.push(step1.output.trim());
+  const authUrl = extractFirstUrl(step1.output);
+  if (step1.code === 0 && !authUrl) {
+    lines.push("[gog] no auth URL was detected in step 1 output.");
+  }
+
+  return {
+    ok: step1.code === 0 && Boolean(authUrl),
+    account,
+    authUrl,
+    output: `${lines.join("\n")}\n`,
+  };
+}
+
+async function finishGogRemoteAuthFlow(accountInput, authUrl) {
+  const account = resolveGogAccount(accountInput);
+  const redirectUrl = String(authUrl || "").trim();
+  if (!redirectUrl) throw new Error("Missing redirect URL from browser.");
+
+  const lines = [];
+  const step2 = await runGog([
+    "auth",
+    "add",
+    account,
+    "--services",
+    GOG_DEFAULT_SERVICES,
+    "--remote",
+    "--step",
+    "2",
+    "--auth-url",
+    redirectUrl,
+  ], { ensureKeyringPassword: true });
+  lines.push(`[gog] auth add remote step 2 (${account}) exit=${step2.code}`);
+  if (step2.output) lines.push(step2.output.trim());
+
+  const status = await runGog(["auth", "status"], {
+    env: { GOG_ACCOUNT: account },
+    ensureKeyringPassword: true,
+  });
+  lines.push(`[gog] auth status (${account}) exit=${status.code}`);
+  if (status.output) lines.push(status.output.trim());
+
+  return {
+    ok: step2.code === 0 && status.code === 0,
+    account,
+    output: `${lines.join("\n")}\n`,
+  };
 }
 
 function ensureGogSkillSeeded() {
@@ -801,6 +965,33 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
   </div>
 
   <div class="card">
+    <h2>gog OAuth repair</h2>
+    <p class="muted">Use this when <code>gog</code> already has OAuth client credentials but still needs account authorization. Step 1 gives you a Google consent URL. Step 2 stores the refresh token after you paste back the full redirect URL from your browser.</p>
+
+    <label>Google account email</label>
+    <input id="gogOauthAccount" placeholder="you@example.com" />
+    <div id="gogOauthHint" class="muted" style="margin-top:0.35rem"></div>
+
+    <div style="margin-top:0.75rem">
+      <button id="gogOauthStart" style="background:#1d4ed8">1) Generate auth URL</button>
+    </div>
+
+    <div id="gogOauthUrlWrap" style="margin-top:0.75rem; display:none">
+      <div class="muted" style="margin-bottom:0.35rem">Open this URL in your browser, approve access, then paste the full redirect URL below.</div>
+      <a id="gogOauthLink" href="#" target="_blank" rel="noreferrer" style="word-break:break-all"></a>
+    </div>
+
+    <label>Paste full redirect URL from browser address bar</label>
+    <input id="gogOauthRedirectUrl" placeholder="http://127.0.0.1:.../oauth2/callback?code=...&state=..." />
+
+    <div style="margin-top:0.75rem">
+      <button id="gogOauthFinish" style="background:#065f46">2) Finish OAuth</button>
+    </div>
+
+    <pre id="gogOauthOut" style="white-space:pre-wrap"></pre>
+  </div>
+
+  <div class="card">
     <h2>Config editor (advanced)</h2>
     <p class="muted">Edits the full config file on disk (JSON5). Saving creates a timestamped <code>.bak-*</code> backup and restarts the gateway.</p>
     <div class="muted" id="configPath"></div>
@@ -962,11 +1153,38 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     openclawVersion: version.output.trim(),
     channelsAddHelp: channelsHelp.output,
     authGroups: AUTH_GROUPS,
+    gog: {
+      account: process.env.GOG_ACCOUNT || null,
+      clientEnvConfigured: Boolean(process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim()),
+      tokenEnvConfigured: Boolean(process.env.GOG_OAUTH_TOKEN_JSON_B64?.trim()),
+      keyringPasswordEnvConfigured: Boolean(process.env.GOG_KEYRING_PASSWORD?.trim()),
+      keyringPasswordFile: GOG_KEYRING_PASSWORD_FILE,
+      keyringPasswordFileExists: fs.existsSync(GOG_KEYRING_PASSWORD_FILE),
+      defaultServices: GOG_DEFAULT_SERVICES,
+    },
   });
 });
 
 app.get("/setup/api/auth-groups", requireSetupAuth, (_req, res) => {
   res.json({ ok: true, authGroups: AUTH_GROUPS });
+});
+
+app.post("/setup/api/gog/oauth/start", requireSetupAuth, async (req, res) => {
+  try {
+    const result = await startGogRemoteAuthFlow(req.body?.account);
+    return res.status(result.ok ? 200 : 500).json(result);
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: String(err) });
+  }
+});
+
+app.post("/setup/api/gog/oauth/finish", requireSetupAuth, async (req, res) => {
+  try {
+    const result = await finishGogRemoteAuthFlow(req.body?.account, req.body?.redirectUrl);
+    return res.status(result.ok ? 200 : 500).json(result);
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: String(err) });
+  }
 });
 
 function buildOnboardArgs(payload) {
@@ -1331,12 +1549,17 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       clientEnv: process.env.GOG_CLIENT || null,
       keyringBackendEnv: process.env.GOG_KEYRING_BACKEND || null,
       keyringPasswordEnv: Boolean(process.env.GOG_KEYRING_PASSWORD?.trim()),
+      keyringPasswordFile: GOG_KEYRING_PASSWORD_FILE,
+      keyringPasswordFileExists: fs.existsSync(GOG_KEYRING_PASSWORD_FILE),
       serviceAccountBootstrapConfigured:
         Boolean(process.env.GOG_SERVICE_ACCOUNT_JSON_B64?.trim()) &&
         Boolean((process.env.GOG_SERVICE_ACCOUNT_EMAIL || process.env.GOG_ACCOUNT || "").trim()),
       oauthBootstrapConfigured:
         Boolean(process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim()) &&
         Boolean(process.env.GOG_OAUTH_TOKEN_JSON_B64?.trim()),
+      oauthClientOnlyBootstrapConfigured:
+        Boolean(process.env.GOG_OAUTH_CLIENT_JSON_B64?.trim()) &&
+        !Boolean(process.env.GOG_OAUTH_TOKEN_JSON_B64?.trim()),
       version: {
         exit: gogVersion.code,
         output: gogVersionOut.trim(),

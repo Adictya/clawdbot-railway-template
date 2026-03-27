@@ -8,6 +8,16 @@
   var authChoiceEl = document.getElementById('authChoice');
   var logEl = document.getElementById('log');
 
+  // gog OAuth repair
+  var gogOauthAccountEl = document.getElementById('gogOauthAccount');
+  var gogOauthHintEl = document.getElementById('gogOauthHint');
+  var gogOauthStartEl = document.getElementById('gogOauthStart');
+  var gogOauthFinishEl = document.getElementById('gogOauthFinish');
+  var gogOauthLinkEl = document.getElementById('gogOauthLink');
+  var gogOauthUrlWrapEl = document.getElementById('gogOauthUrlWrap');
+  var gogOauthRedirectUrlEl = document.getElementById('gogOauthRedirectUrl');
+  var gogOauthOutEl = document.getElementById('gogOauthOut');
+
   // Debug console
   var consoleCmdEl = document.getElementById('consoleCmd');
   var consoleArgEl = document.getElementById('consoleArg');
@@ -112,6 +122,32 @@
       var ver = j.openclawVersion ? (' | ' + j.openclawVersion) : '';
       setStatus((j.configured ? 'Configured' : 'Not configured - run setup below') + ver);
 
+      if (gogOauthAccountEl && !gogOauthAccountEl.value && j.gog && j.gog.account) {
+        gogOauthAccountEl.value = j.gog.account;
+      }
+
+      if (gogOauthHintEl && j.gog) {
+        var gogNotes = [];
+        if (j.gog.clientEnvConfigured) {
+          gogNotes.push('OAuth client JSON is configured from env.');
+        } else {
+          gogNotes.push('OAuth client JSON env is not set; remote auth will rely on already-stored gog credentials.');
+        }
+        if (j.gog.tokenEnvConfigured) {
+          gogNotes.push('A refresh token import secret is also configured.');
+        } else {
+          gogNotes.push('No refresh token env is configured; use the two-step browser flow below.');
+        }
+        if (j.gog.keyringPasswordEnvConfigured) {
+          gogNotes.push('Keyring password comes from env.');
+        } else if (j.gog.keyringPasswordFileExists) {
+          gogNotes.push('A local gog keyring password file already exists for this container volume.');
+        } else {
+          gogNotes.push('If needed, the wrapper will create a local keyring password file automatically on first OAuth write.');
+        }
+        gogOauthHintEl.textContent = gogNotes.join(' ');
+      }
+
       if (statusDetailsEl) {
         var parts = [];
         parts.push('Gateway target: ' + (j.gatewayTarget || '(unknown)'));
@@ -207,6 +243,57 @@
   if (consoleRunEl) {
     consoleRunEl.onclick = runConsole;
   }
+
+  function startGogOauth() {
+    if (!gogOauthStartEl) return;
+    var account = gogOauthAccountEl ? gogOauthAccountEl.value : '';
+    if (gogOauthOutEl) gogOauthOutEl.textContent = 'Generating Google auth URL...\n';
+    if (gogOauthUrlWrapEl) gogOauthUrlWrapEl.style.display = 'none';
+
+    return httpJson('/setup/api/gog/oauth/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ account: account })
+    }).then(function (j) {
+      if (gogOauthOutEl) gogOauthOutEl.textContent = j.output || JSON.stringify(j, null, 2);
+      if (gogOauthLinkEl && j.authUrl) {
+        gogOauthLinkEl.href = j.authUrl;
+        gogOauthLinkEl.textContent = j.authUrl;
+      }
+      if (gogOauthUrlWrapEl) {
+        gogOauthUrlWrapEl.style.display = j.authUrl ? 'block' : 'none';
+      }
+      return refreshStatus();
+    }).catch(function (e) {
+      if (gogOauthOutEl) gogOauthOutEl.textContent += '\nError: ' + String(e) + '\n';
+    });
+  }
+
+  function finishGogOauth() {
+    if (!gogOauthFinishEl) return;
+    var account = gogOauthAccountEl ? gogOauthAccountEl.value : '';
+    var redirectUrl = gogOauthRedirectUrlEl ? gogOauthRedirectUrlEl.value : '';
+    if (!redirectUrl) {
+      alert('Paste the full redirect URL from your browser first.');
+      return;
+    }
+    if (gogOauthOutEl) gogOauthOutEl.textContent = 'Finishing gog OAuth...\n';
+
+    return httpJson('/setup/api/gog/oauth/finish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ account: account, redirectUrl: redirectUrl })
+    }).then(function (j) {
+      if (gogOauthOutEl) gogOauthOutEl.textContent = j.output || JSON.stringify(j, null, 2);
+      if (gogOauthRedirectUrlEl) gogOauthRedirectUrlEl.value = '';
+      return refreshStatus();
+    }).catch(function (e) {
+      if (gogOauthOutEl) gogOauthOutEl.textContent += '\nError: ' + String(e) + '\n';
+    });
+  }
+
+  if (gogOauthStartEl) gogOauthStartEl.onclick = startGogOauth;
+  if (gogOauthFinishEl) gogOauthFinishEl.onclick = finishGogOauth;
 
   // Config raw load/save
   function loadConfigRaw() {

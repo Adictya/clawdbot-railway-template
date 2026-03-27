@@ -43,7 +43,8 @@ Optional:
 - `GOG_ACCOUNT` — default `gog` account/email alias for non-interactive commands
 - `GOG_CLIENT` — optional named OAuth client bucket for `gog`
 - `GOG_SERVICE_ACCOUNT_EMAIL` + `GOG_SERVICE_ACCOUNT_JSON_B64` — preferred `gog` bootstrap for Google Workspace/domain-wide delegation
-- `GOG_OAUTH_CLIENT_JSON_B64` + `GOG_OAUTH_TOKEN_JSON_B64` + `GOG_KEYRING_PASSWORD` — pre-seed `gog` OAuth auth from Railway secrets
+- `GOG_OAUTH_CLIENT_JSON_B64` — install `gog` OAuth client credentials so `/setup` can complete browser-based auth
+- `GOG_OAUTH_TOKEN_JSON_B64` + `GOG_KEYRING_PASSWORD` — optional fully non-interactive `gog` OAuth bootstrap from Railway secrets
 - `JIRA_SERVER` + `JIRA_LOGIN` + `JIRA_PROJECT` + `JIRA_API_TOKEN` — bootstrap `jira` CLI on first boot
 - `JIRA_INSTALLATION=cloud|local` — defaults to `cloud`
 - `JIRA_AUTH_TYPE=basic|bearer|mtls` — set `bearer` for Jira Server/Data Center PATs
@@ -57,6 +58,7 @@ Notes:
 - This template pins OpenClaw to a released version by default via Docker build arg `OPENCLAW_GIT_REF` (override if you want `main`).
 - All `GOG_*_JSON_B64` values should be base64-encoded file contents with newlines removed.
 - If both `gog` service-account and OAuth bootstrap secrets are present for the same account, `gog` prefers the service account.
+- If `GOG_KEYRING_PASSWORD` is not set, the image can generate and persist a local `gog` keyring password file for convenience at `/data/.config/gogcli/.wrapper-keyring-password`.
 - `jira` stores config metadata on disk, but continues to read `JIRA_API_TOKEN` from Railway env at runtime.
 - The Linear skill ships with its Node dependencies preinstalled in the image.
 
@@ -107,6 +109,7 @@ What persists cleanly today:
   - npm globals: `/data/npm` (binaries in `/data/npm/bin`)
   - pnpm globals: `/data/pnpm` (binaries) + `/data/pnpm-store` (store)
 - **`gog` config + keyring:** `/data/.config/gogcli` (via `XDG_CONFIG_HOME=/data/.config` and `GOG_KEYRING_BACKEND=file`)
+- **`gog` wrapper keyring password file:** `/data/.config/gogcli/.wrapper-keyring-password` when auto-generated for interactive OAuth flows
 - **`jira` config:** `/data/.config/.jira/.config.yml` (via `JIRA_CONFIG_FILE=/data/.config/.jira/.config.yml`)
 - **Notion file fallback:** `/data/.config/notion/api_key` if you choose file-based auth instead of `NOTION_API_KEY`
 - **Python packages:** create a venv under `/data` (example below). The runtime image includes Python + venv support.
@@ -138,7 +141,9 @@ mkdir -p /data/npm /data/npm-cache /data/pnpm /data/pnpm-store
 
 - The image includes `gog` at `/usr/local/bin/gog`.
 - On boot, the wrapper can hydrate `gog` auth from Railway secrets so `gog` is ready immediately after deploy.
+- If only `GOG_OAUTH_CLIENT_JSON_B64` is present, the wrapper stores the OAuth client and leaves account authorization to the `/setup` browser flow.
 - The setup console includes safe `gog` commands for inspection and repair, including `gog.bootstrap`, `gog auth list`, `gog auth status`, `gog auth keyring`, and `gog auth service-account status <email>`.
+- `/setup` also includes a dedicated two-step `gog` OAuth repair card: generate the Google auth URL, approve access in your browser, then paste back the final redirect URL.
 - The bundled `gog` skill is copied into `/data/workspace/skills/gog/SKILL.md` if it is not already present.
 
 ### Recommended `gog` auth modes
@@ -147,9 +152,13 @@ mkdir -p /data/npm /data/npm-cache /data/pnpm /data/pnpm-store
    - Set `GOG_SERVICE_ACCOUNT_EMAIL` to the user to impersonate.
    - Set `GOG_SERVICE_ACCOUNT_JSON_B64` to the base64-encoded service-account JSON.
 2. Regular OAuth refresh token
+    - Set `GOG_OAUTH_CLIENT_JSON_B64` to the base64-encoded OAuth client JSON.
+    - Set `GOG_OAUTH_TOKEN_JSON_B64` to the base64-encoded token export JSON from an already-authorized `gog` install.
+    - Set `GOG_KEYRING_PASSWORD` so the file keyring works non-interactively in the container.
+3. Client JSON only + `/setup` browser handoff
    - Set `GOG_OAUTH_CLIENT_JSON_B64` to the base64-encoded OAuth client JSON.
-   - Set `GOG_OAUTH_TOKEN_JSON_B64` to the base64-encoded token export JSON from an already-authorized `gog` install.
-   - Set `GOG_KEYRING_PASSWORD` so the file keyring works non-interactively in the container.
+   - Open `/setup`, use the `gog OAuth repair` card, click `Generate auth URL`, complete the Google consent screen, then paste back the final redirect URL.
+   - If `GOG_KEYRING_PASSWORD` is not set, the wrapper will generate a persistent local keyring password file automatically so both `/setup` and SSH sessions can reuse the stored token.
 
 Example base64 encoding on macOS/Linux:
 
@@ -159,7 +168,7 @@ base64 < oauth-client.json | tr -d '\n'
 base64 < gog-token-export.json | tr -d '\n'
 ```
 
-After changing any `GOG_*` Railway secret, redeploy the service. If auth drifts, open `/setup` and run `gog.bootstrap`.
+After changing any `GOG_*` Railway secret, redeploy the service. If auth drifts, open `/setup`, run `gog.bootstrap`, or use the `gog OAuth repair` flow.
 
 ## `jira` CLI and skill
 

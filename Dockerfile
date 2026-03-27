@@ -109,8 +109,26 @@ RUN apt-get update \
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
-COPY --from=gog-fetch /out/gog /usr/local/bin/gog
+RUN install -d /usr/local/libexec
+COPY --from=gog-fetch /out/gog /usr/local/libexec/gog-real
 COPY --from=jira-fetch /out/jira /usr/local/bin/jira
+RUN printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'backend="${GOG_KEYRING_BACKEND:-file}"' \
+  'if [ -z "${GOG_KEYRING_PASSWORD:-}" ] && [ "$backend" = "file" ]; then' \
+  '  cfg_root="${XDG_CONFIG_HOME:-/data/.config}/gogcli"' \
+  '  pwfile="${GOG_WRAPPER_KEYRING_PASSWORD_FILE:-$cfg_root/.wrapper-keyring-password}"' \
+  '  if [ ! -f "$pwfile" ]; then' \
+  '    mkdir -p "$(dirname "$pwfile")"' \
+  '    umask 077' \
+  '    python3 -c "import secrets,sys;sys.stdout.write(secrets.token_hex(32))" > "$pwfile"' \
+  '  fi' \
+  '  export GOG_KEYRING_PASSWORD="$(tr -d "\r\n" < "$pwfile")"' \
+  'fi' \
+  'exec /usr/local/libexec/gog-real "$@"' \
+  > /usr/local/bin/gog \
+  && chmod +x /usr/local/bin/gog
 
 # Persist user-installed tools by default by targeting the Railway volume.
 # - npm global installs -> /data/npm
@@ -121,6 +139,7 @@ ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
 ENV XDG_CONFIG_HOME=/data/.config
 ENV GOG_KEYRING_BACKEND=file
+ENV GOG_WRAPPER_KEYRING_PASSWORD_FILE=/data/.config/gogcli/.wrapper-keyring-password
 ENV JIRA_CONFIG_FILE=/data/.config/.jira/.config.yml
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 
